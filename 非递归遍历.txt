@@ -1,0 +1,226 @@
+在FileX里遍历目录及其子目录（非递归）
+    基本思想是，
+        先保存最开始的文件夹路径root（通过fx_directory_default_get获取并通过strcmp保存，该root不限于磁盘根目录）；
+            遍历当前目录的子项，若是子项是文件夹，则将默认文件夹切换到该子项（通过fx_directory_default_set）；
+                当一个文件夹遍历完成后，判断当前是否是root（通过fx_directory_default_get获取并对比）,
+    如不是，就通过“..”目录项切换回上层文件夹，继续遍历；
+            递归在文件夹过深时可能导致爆栈，所以不使用。
+
+                注意：
+                    举个例子，某文件夹下有文件夹以及文件共5个；
+                        我们一般循环调用fx_directory_next_full_entry_find就可以遍历此目录下的所有子项，说明filex维护了一个index类似的变量，记录当前遍历到了第几个子项，在每次调用时index自动 +
+        1； 但是每个文件夹又没有类似于FX_FILE这种一一对应的参数内存，这就说明所有的文件夹都是用同一个全局变量index。
+            这就导致了，如果你在遍历到中间时切换到子目录，或者从子目录返回上层目录，index值依旧是上一个文件夹遍历的位置，而不是当前的。
+                fx_directory_first_full_entry_find这个函数可以猜测就是手动把index置0的接口。
+                    所以在切换到子目录后，需要先fx_directory_first_full_entry_find一下，选中第一个子项。
+                        但是在返回上层目录时，原先遍历到第几个子项的index信息就丢失了，因为被子目录的给覆盖了。
+                            所以我们需要手动维护每一层目录的index值。然后在返回此层时，多次调用next_full_entry_find执行空操作来跳过之前已经遍历的子项。
+                                index是每层遍历的子项序号，所以需要建立一个与层数有关的index数组即可。如UINT index[MAX_DIR_TRAVEL_DEEP];
+
+一、基本操作
+1.获取当前所在文件夹的路径。（获取默认文件夹） 使用函数fx_directory_default_get。 CHAR *current_default_dir;
+CHAR root[FX_MAXIMUM_PATH];
+UINT status;
+&#8203;
+status = fx_directory_default_get(media, &current_default_dir);
+if (FX_SUCCESS != status)
+{
+    log_err("fx_directory_default_get failed. code:%x", status);
+    return status;
+}
+&#8203;
+log_debug("fx_directory_default_get ok: %s", current_default_dir);
+&#8203;
+// 注意：current_default_dir是指向全局唯一的当前默认目录的指针，
+// 其指针内容会随之后调用的fx_directory_default_set而改变
+// 所以在需要时，要手动复制保存
+strncpy(root, current_default_dir, FX_MAXIMUM_PATH);
+2.打开子文件夹或返回上层文件夹（设置默认文件夹） 使用函数fx_directory_default_set。类似于cd dir_name和cd..
+    // 进入此文件夹
+    status = fx_directory_default_set(media, entry_name);
+if (FX_SUCCESS != status)
+{
+    log_err("fx_directory_default_set failed. code:%x", status);
+    return status;
+}
+&#8203;
+// 返回上层目录
+status = fx_directory_default_set(media, "..");
+if (FX_SUCCESS != status)
+{
+    log_err("fx_directory_default_set failed. code:%x", status);
+    return status;
+}
+二、实现 // 打印出来
+    static void
+    print_dir(UCHAR deep, CHAR *info)
+{
+    for (CHAR i = 0; i <= deep; i++)
+    {
+        if (0 == i)
+            printf("--");
+        else
+            printf("----");
+    }
+    printf(" %s\r\n", info);
+}
+&#8203;
+&#8203;
+/**
+ * @brief 遍历文件夹。使用前请指定默认文件夹
+ * @param old_seek_index  用于存储在不同深度遍历到的item序号的数组
+ * @param deep_max 指定允许遍历的最大深度。最小为1。例如如果仅需要遍历当前目录，不遍历子目录，则置1即可。
+ * @retval
+ */
+UINT filex_dir_travel(FX_MEDIA *media, UINT *old_seek_index, UINT deep_max)
+{
+    UCHAR deep = 0;
+    UCHAR dir_seek_index;
+    UCHAR dir_seek_init;
+    UINT status;
+    CHAR entry_name[FX_MAX_LONG_NAME_LEN];
+    CHAR root[FX_MAXIMUM_PATH];
+    CHAR *current_default_dir;
+    UINT attributes;
+    ULONG size;
+
+    if (0 == deep_max)
+        return FX_FALSE;
+
+    // 先获取此文件夹路径，并存储
+    status = fx_directory_default_get(media, &current_default_dir);
+    if (FX_SUCCESS != status)
+    {
+        log_err("fx_directory_default_get failed. code:%x", status);
+        return status;
+    }
+
+    log_debug("fx_directory_default_get ok: %s", current_default_dir);
+
+    // current_default_dir是指向全局当前默认目录的指针，指针内容会随fx_directory_default_set而改变
+    // 所以需要先复制保存
+    strncpy(root, current_default_dir, FX_MAXIMUM_PATH);
+
+#if 1
+    old_seek_index[0] = 0;
+    dir_seek_init = 0;
+
+    while (1)
+    {
+        if (0 == dir_seek_init) // 如果需要重新遍历文件夹
+        {
+            status = fx_directory_first_full_entry_find(media, entry_name, &attributes, &size,
+                                                        FX_NULL, FX_NULL, FX_NULL, FX_NULL, FX_NULL, FX_NULL);
+            dir_seek_init = 1;
+            dir_seek_index = 0;
+        }
+
+        // 维护dir seek的位置
+        for (UINT i = dir_seek_index; i < old_seek_index[deep]; i++)
+        {
+            status = fx_directory_next_full_entry_find(media, entry_name, &attributes, &size,
+                                                       FX_NULL, FX_NULL, FX_NULL, FX_NULL, FX_NULL, FX_NULL);
+            dir_seek_index++;
+        }
+
+        if (FX_SUCCESS != status)
+        {
+            if (FX_NO_MORE_ENTRIES != status)
+                return status;
+
+            // 本层目录遍历完成了
+            // 获取当前路径
+            status = fx_directory_default_get(media, &current_default_dir);
+            if (FX_SUCCESS != status)
+            {
+                log_err("fx_directory_default_get failed. code:%x", status);
+                return status;
+            }
+
+            // 如果处在一级目录，就表示遍历完成了
+            if (strcmp(root, current_default_dir) == 0)
+            {
+                break;
+            }
+
+            // 不然就返回上一目录
+            status = fx_directory_default_set(media, "..");
+            if (FX_SUCCESS != status)
+            {
+                log_err("fx_directory_default_set failed. code:%x", status);
+                return status;
+            }
+
+            deep--;            // 返回上一层
+            dir_seek_init = 0; // 需要刷新一下entry_find逻辑
+            continue;
+        }
+
+        // 处理"."目录和".."目录
+        if ((strcmp(entry_name, ".") == 0) || (strcmp(entry_name, "..") == 0))
+        {
+            //            print_dir(deep, entry_name);
+            old_seek_index[deep]++;
+            continue;
+        }
+
+        // 若是普通文件夹
+        if (attributes & FX_DIRECTORY)
+        {
+            print_dir(deep, entry_name);
+            old_seek_index[deep]++;
+
+            if (deep >= deep_max - 1)
+                continue; // 达到最大允许遍历深度
+
+            // 进入此文件夹
+            status = fx_directory_default_set(media, entry_name);
+            if (FX_SUCCESS != status)
+            {
+                log_err("fx_directory_default_set failed. code:%x", status);
+                return status;
+            }
+
+            deep += 1;                // 进入下一层
+            old_seek_index[deep] = 0; // 初始化新层的item序号
+            dir_seek_init = 0;        // 需要刷新一下entry_find逻辑
+            continue;
+        }
+
+        // 若是文件
+        print_dir(deep, entry_name);
+        old_seek_index[deep]++;
+    }
+#endif
+
+    return FX_SUCCESS;
+}
+三、使用void demo(void)
+{
+    UINT sd_status = FX_SUCCESS;
+    ULONG64 available_bytes;
+#define MAX_DIR_TRAVEL_DEEP 16
+    UINT old_seek_index[MAX_DIR_TRAVEL_DEEP];
+
+    sd_status = fx_media_open(&sdio_disk, FX_SD_VOLUME_NAME, fx_stm32_sd_driver, (VOID *)FX_NULL, (VOID *)fx_sd_media_memory, sizeof(fx_sd_media_memory));
+    &#8203;
+    /* Check the media open sd_status */
+    if (sd_status != FX_SUCCESS)
+    {
+        log_err("fx open fail. %x", sd_status);
+        return;
+    }
+
+    sd_status = dv_filex_dir_travel(&sdio_disk, old_seek_index, MAX_DIR_TRAVEL_DEEP);
+    if (FX_SUCCESS != sd_status)
+    {
+        log_err("dv_filex_dir_travel err: %d", sd_status);
+    }
+    &#8203;
+    /* 卸载 SD 卡 */
+    sd_status = fx_media_close(&sdio_disk);
+    if (sd_status != FX_SUCCESS)
+    {
+        log_err("卸载文件系统卸载失败 -- %d\r\n", sd_status);
+    }
+}
